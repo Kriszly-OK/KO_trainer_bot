@@ -24,7 +24,8 @@ from calendar_client import (
 from database import (
     init_db, log_meal, get_daily_totals, get_config,
     set_config, log_checkin, get_last_checkin,
-    set_fridge, get_fridge, add_to_daily_log, get_daily_log
+    set_fridge, get_fridge, add_to_daily_log, get_daily_log,
+    delete_todays_meals
 )
 from ai_client import ask_claude
 
@@ -607,15 +608,6 @@ async def process_fridge_update(update: Update, text: str):
         f"✅ Fridge updated.\n\n🍽 *Meal ideas:*\n{suggestions}",
         parse_mode="Markdown"
     )
-
-
-# ── Delete today's meals ─────────────────────────────────────────────────────
-def delete_todays_meals():
-    from database import get_conn
-    conn = get_conn()
-    conn.execute("DELETE FROM meals WHERE date = ?", (date.today().isoformat(),))
-    conn.commit()
-    conn.close()
 
 
 # ── Prompt builders ──────────────────────────────────────────────────────────
