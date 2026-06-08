@@ -6,6 +6,7 @@ Powered by Claude (Anthropic API) + Google Calendar
 import os
 import logging
 import json
+import tempfile
 from datetime import datetime, date
 import pytz
 
@@ -385,7 +386,50 @@ async def handle_checkin_data(update, context, text):
     )
 
 
-# ── Smart intent detection ───────────────────────────────────────────────────
+# ── Voice message handler ─────────────────────────────────────────────────────
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorised(update): return
+
+    await update.message.reply_text("🎙 Got it, transcribing...")
+
+    try:
+        import whisper
+
+        # Download voice file from Telegram
+        voice = update.message.voice
+        file = await context.bot.get_file(voice.file_id)
+
+        with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
+            tmp_path = tmp.name
+
+        await file.download_to_drive(tmp_path)
+
+        # Transcribe with Whisper
+        model = whisper.load_model("tiny")  # tiny = fast, good enough for short messages
+        result = model.transcribe(tmp_path)
+        text = result["text"].strip()
+
+        # Clean up temp file
+        os.unlink(tmp_path)
+
+        if not text:
+            await update.message.reply_text("Couldn't make out what you said — try again?")
+            return
+
+        await update.message.reply_text(f"_Heard: {text}_", parse_mode="Markdown")
+
+        # Route through same smart intent detection as text messages
+        await handle_smart_message(update, context, text)
+
+    except ImportError:
+        await update.message.reply_text(
+            "⚠️ Whisper isn't installed. Ask Krisz to add `openai-whisper` to requirements.txt."
+        )
+    except Exception as e:
+        logger.error(f"Voice transcription error: {e}")
+        await update.message.reply_text(
+            "Something went wrong transcribing that. Try typing it instead."
+        )
 async def handle_smart_message(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
     """
     Uses Claude to classify what Krisz is trying to do, then routes accordingly.
@@ -545,6 +589,7 @@ def main():
     app.add_handler(CommandHandler("week", week))
     app.add_handler(CommandHandler("ask", ask))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(MessageHandler(filters.VOICE, handle_voice))
 
     setup_scheduler(app)
 
