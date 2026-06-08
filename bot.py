@@ -58,7 +58,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📊 *Targets*\n"
         "• Calories: 2,155 (rest days ~1,900)\n"
         "• Protein: 124g baseline, 135g+ on training days\n\n"
-        "These are already saved. A couple of quick questions to finish setup:\n\n"
+        "These are already saved. One quick question to finish setup:\n\n"
         "1️⃣ What's your current weight in kg? (I'll use this as your baseline)",
         parse_mode="Markdown"
     )
@@ -69,10 +69,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorised(update): return
     await update.message.reply_text(
-        "🤖 *K_O Trainer Bot — Commands*\n\n"
+        "🤖 *K O Trainer Bot — Commands*\n\n"
         "/today — Today's training + nutrition plan\n"
         "/log [food] — Log a meal\n"
         "/totals — Today's calorie & protein totals\n"
+        "/meals — Show all meals logged today\n"
+        "/reset — Clear today's food log and start from zero\n"
         "/fridge — Update your fridge/food inventory\n"
         "/checkin — Log weekly weight & body comp\n"
         "/week — This week's training & meal overview\n"
@@ -90,12 +92,13 @@ async def today(update: Update, context: ContextTypes.DEFAULT_TYPE):
     today_events = get_todays_events()
     tomorrow_events = get_tomorrows_events()
     totals = get_daily_totals(date.today().isoformat())
+    meals = get_daily_log(date.today().isoformat())
     fridge = get_fridge()
     last_checkin = get_last_checkin()
     wfh = context.user_data.get("wfh_today")
 
     prompt = build_daily_prompt(
-        today_events, tomorrow_events, totals, fridge,
+        today_events, tomorrow_events, totals, meals, fridge,
         last_checkin, wfh, mode="full_day"
     )
     response = await ask_claude(prompt)
@@ -109,49 +112,39 @@ async def log_food(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not text:
         await update.message.reply_text("Tell me what you ate, e.g. /log chicken salad with quinoa")
         return
+    await process_food_log(update, text)
 
-    totals_before = get_daily_totals(date.today().isoformat())
-    prompt = (
-        f"The user just logged this meal: '{text}'\n"
-        f"Today's running totals so far: {json.dumps(totals_before)}\n"
-        f"Daily targets: 2155 kcal, 124g protein (135g on training days).\n\n"
-        f"Estimate the calories and protein in this meal. Be realistic — don't low-ball.\n"
-        f"Reply in this exact format:\n"
-        f"CALORIES: [number]\n"
-        f"PROTEIN: [number]\n"
-        f"COMMENT: [one short sentence — running total context, flag if getting close to limit, "
-        f"or note if protein is low for the meal]"
+
+# ── /meals ───────────────────────────────────────────────────────────────────
+async def meals_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorised(update): return
+    meals = get_daily_log(date.today().isoformat())
+    if not meals:
+        await update.message.reply_text("Nothing logged yet today.")
+        return
+
+    lines = []
+    for m in meals:
+        lines.append(f"• {m['description']} — {m['calories']} kcal · {m['protein']}g protein")
+
+    totals = get_daily_totals(date.today().isoformat())
+    lines.append(f"\n*Total: {totals['calories']} kcal · {totals['protein']}g protein*")
+
+    await update.message.reply_text(
+        "*Today's logged meals:*\n\n" + "\n".join(lines),
+        parse_mode="Markdown"
     )
-    response = await ask_claude(prompt)
 
-    lines = response.strip().split("\n")
-    cal = prot = 0
-    comment = ""
-    for line in lines:
-        if line.startswith("CALORIES:"):
-            try: cal = int(line.split(":")[1].strip())
-            except: pass
-        elif line.startswith("PROTEIN:"):
-            try: prot = int(line.split(":")[1].strip())
-            except: pass
-        elif line.startswith("COMMENT:"):
-            comment = line.split(":", 1)[1].strip()
 
-    if cal > 0:
-        log_meal(date.today().isoformat(), text, cal, prot)
-        new_totals = get_daily_totals(date.today().isoformat())
-        await update.message.reply_text(
-            f"✅ Logged: *{text}*\n"
-            f"~{cal} kcal · {prot}g protein\n\n"
-            f"📊 *Today so far:* {new_totals['calories']} kcal · {new_totals['protein']}g protein\n\n"
-            f"_{comment}_",
-            parse_mode="Markdown"
-        )
-    else:
-        await update.message.reply_text(
-            f"Logged '{text}' — couldn't parse exact numbers but noted it.\n\n_{response}_",
-            parse_mode="Markdown"
-        )
+# ── /reset ───────────────────────────────────────────────────────────────────
+async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorised(update): return
+    context.user_data["awaiting_reset_confirm"] = True
+    await update.message.reply_text(
+        "Are you sure you want to delete all food logged today and start from zero?\n\n"
+        "Reply *yes* to confirm or anything else to cancel.",
+        parse_mode="Markdown"
+    )
 
 
 # ── /totals ──────────────────────────────────────────────────────────────────
@@ -222,7 +215,7 @@ async def fridge_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Her targets: ~2155 kcal/day, 124g protein. She likes simple meals — salads, beans, "
         f"lentils, a protein source. She gets bored of meal prep. Prefers variety.\n"
         f"Suggest 3 simple meals she could make this week from these ingredients. "
-        f"Keep each suggestion to one line. Be practical, not aspirational."
+        f"One line each. Practical, not aspirational. No markdown headers."
     )
     suggestions = await ask_claude(prompt)
     await update.message.reply_text(
@@ -262,9 +255,9 @@ async def week(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Provide:\n"
         f"1. Training recommendation for the week (she's in a half marathon Runna block, "
         f"Ashtanga is strength training, not light)\n"
-        f"2. Nutrition focus for the week in 2–3 sentences\n"
+        f"2. Nutrition focus for the week in 2-3 sentences\n"
         f"3. One thing to watch or improve this week\n\n"
-        f"Keep it tight — no fluff."
+        f"Keep it tight — no fluff. Use *bold* for section labels only, no ## headers."
     )
     response = await ask_claude(prompt)
     await update.message.reply_text(response, parse_mode="Markdown")
@@ -280,9 +273,10 @@ async def ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     today_events = get_todays_events()
     totals_today = get_daily_totals(date.today().isoformat())
+    meals_today = get_daily_log(date.today().isoformat())
     last_checkin = get_last_checkin()
 
-    prompt = build_coach_prompt(question, today_events, totals_today, last_checkin)
+    prompt = build_coach_prompt(question, today_events, totals_today, meals_today, last_checkin)
     response = await ask_claude(prompt)
     await update.message.reply_text(response, parse_mode="Markdown")
 
@@ -309,6 +303,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Just send a number, e.g. 68.5")
         return
 
+    # Handle reset confirmation
+    if context.user_data.get("awaiting_reset_confirm"):
+        context.user_data.pop("awaiting_reset_confirm", None)
+        if text.lower().strip() == "yes":
+            delete_todays_meals()
+            await update.message.reply_text("✅ Today's food log cleared. Starting from zero.")
+        else:
+            await update.message.reply_text("Cancelled — log kept as is.")
+        return
+
     # Handle check-in data
     if context.user_data.get("awaiting_checkin"):
         await handle_checkin_data(update, context, text)
@@ -322,10 +326,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         today_events = get_todays_events()
         tomorrow_events = get_tomorrows_events()
         totals_today = get_daily_totals(date.today().isoformat())
+        meals_today = get_daily_log(date.today().isoformat())
         fridge = get_fridge()
         last_checkin_data = get_last_checkin()
         prompt = build_daily_prompt(
-            today_events, tomorrow_events, totals_today,
+            today_events, tomorrow_events, totals_today, meals_today,
             fridge, last_checkin_data, wfh, mode="full_day"
         )
         response = await ask_claude(prompt)
@@ -372,8 +377,8 @@ async def handle_checkin_data(update, context, text):
         f"Krisz just logged her weekly check-in: {details}\n"
         f"Previous data: {json.dumps(last)}\n"
         f"Her goal: body recomposition + marathon training. Targets: 2155 kcal, 124g protein.\n"
-        f"Give her a 2–3 sentence honest assessment of her progress. "
-        f"Flag anything worth adjusting. No cheerleading."
+        f"Give her a 2-3 sentence honest assessment of her progress. "
+        f"Flag anything worth adjusting. No cheerleading. No markdown headers."
     )
     assessment = await ask_claude(prompt)
     await update.message.reply_text(
@@ -425,59 +430,46 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ── Smart intent detection ───────────────────────────────────────────────────
 async def handle_smart_message(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
+    """
+    Uses Claude to classify what Krisz is trying to do, then routes accordingly.
+    Intent classification happens before any action is taken.
+    """
     intent_prompt = (
-        f"Classify this message from Krisz into exactly one of these intents:\n"
-        f"- food_log: she is telling you what she ate or drank\n"
-        f"- weight_checkin: she is sharing her weight, body fat, or muscle percentage\n"
-        f"- fridge_update: she is listing food she has at home\n"
-        f"- wfh_response: she is saying whether she is working from home or the office today\n"
-        f"- question: she is asking something or having a general conversation\n\n"
+        f"Classify this message into exactly one intent. Be precise.\n\n"
+        f"Intents:\n"
+        f"- food_log: she is REPORTING what she has eaten or is eating right now (statements like 'I had X', 'just ate X', 'eating X')\n"
+        f"- food_question: she is ASKING about food, calories, nutrition, or what to eat (questions about food, not reporting eating)\n"
+        f"- delete_log: she wants to delete, clear, reset, or undo logged food\n"
+        f"- show_log: she wants to see what she has logged today\n"
+        f"- weight_checkin: she is sharing her weight, body fat, or muscle percentage numbers\n"
+        f"- fridge_update: she is listing food she has at home for the week\n"
+        f"- wfh_response: she is saying whether she is working from home or in the office today\n"
+        f"- question: anything else — general questions, training advice, conversation\n\n"
         f"Message: '{text}'\n\n"
-        f"Reply with ONLY the intent word, nothing else."
+        f"Reply with ONLY the intent word. Nothing else."
     )
     intent = (await ask_claude(intent_prompt, max_tokens=20)).strip().lower()
+    logger.info(f"Intent detected: {intent} for message: {text[:50]}")
 
     if "food_log" in intent:
-        totals_before = get_daily_totals(date.today().isoformat())
-        prompt = (
-            f"The user just logged this meal: '{text}'\n"
-            f"Today's running totals so far: {json.dumps(totals_before)}\n"
-            f"Daily targets: 2155 kcal, 124g protein (135g on training days).\n\n"
-            f"Estimate the calories and protein in this meal. Be realistic — don't low-ball.\n"
-            f"Reply in this exact format:\n"
-            f"CALORIES: [number]\n"
-            f"PROTEIN: [number]\n"
-            f"COMMENT: [one short sentence — running total context, flag if getting close to limit, "
-            f"or note if protein is low for the meal]"
-        )
-        response = await ask_claude(prompt)
-        lines = response.strip().split("\n")
-        cal = prot = 0
-        comment = ""
-        for line in lines:
-            if line.startswith("CALORIES:"):
-                try: cal = int(line.split(":")[1].strip())
-                except: pass
-            elif line.startswith("PROTEIN:"):
-                try: prot = int(line.split(":")[1].strip())
-                except: pass
-            elif line.startswith("COMMENT:"):
-                comment = line.split(":", 1)[1].strip()
+        await process_food_log(update, text)
 
-        if cal > 0:
-            log_meal(date.today().isoformat(), text, cal, prot)
-            new_totals = get_daily_totals(date.today().isoformat())
-            await update.message.reply_text(
-                f"✅ Logged: *{text}*\n"
-                f"~{cal} kcal · {prot}g protein\n\n"
-                f"📊 *Today so far:* {new_totals['calories']} kcal · {new_totals['protein']}g protein\n\n"
-                f"_{comment}_",
-                parse_mode="Markdown"
-            )
-        else:
-            await update.message.reply_text(
-                f"Noted '{text}' but couldn't estimate calories. Try being more specific."
-            )
+    elif "delete_log" in intent:
+        context.user_data["awaiting_reset_confirm"] = True
+        await update.message.reply_text(
+            "Delete all food logged today and start from zero?\n\nReply *yes* to confirm.",
+            parse_mode="Markdown"
+        )
+
+    elif "show_log" in intent:
+        meals = get_daily_log(date.today().isoformat())
+        if not meals:
+            await update.message.reply_text("Nothing logged yet today.")
+            return
+        lines = [f"• {m['description']} — {m['calories']} kcal · {m['protein']}g protein" for m in meals]
+        t = get_daily_totals(date.today().isoformat())
+        lines.append(f"\n*Total: {t['calories']} kcal · {t['protein']}g protein*")
+        await update.message.reply_text("*Today's logged meals:*\n\n" + "\n".join(lines), parse_mode="Markdown")
 
     elif "weight_checkin" in intent:
         await handle_checkin_data(update, context, text)
@@ -486,9 +478,8 @@ async def handle_smart_message(update: Update, context: ContextTypes.DEFAULT_TYP
         set_fridge(text)
         prompt = (
             f"Krisz has the following food at home: {text}\n"
-            f"Her targets: ~2155 kcal/day, 124g protein. She likes simple meals — salads, beans, "
-            f"lentils, a protein source. Gets bored of meal prep. Prefers variety.\n"
-            f"Suggest 3 simple meals she could make this week. One line each. Practical, not aspirational."
+            f"Her targets: ~2155 kcal/day, 124g protein. Simple meals, variety, no long prep.\n"
+            f"Suggest 3 meals for the week. One line each. No markdown headers."
         )
         suggestions = await ask_claude(prompt)
         await update.message.reply_text(
@@ -502,28 +493,89 @@ async def handle_smart_message(update: Update, context: ContextTypes.DEFAULT_TYP
         today_events = get_todays_events()
         tomorrow_events = get_tomorrows_events()
         totals_today = get_daily_totals(date.today().isoformat())
+        meals_today = get_daily_log(date.today().isoformat())
         fridge = get_fridge()
         last_checkin_data = get_last_checkin()
         prompt = build_daily_prompt(
-            today_events, tomorrow_events, totals_today,
+            today_events, tomorrow_events, totals_today, meals_today,
             fridge, last_checkin_data, wfh, mode="full_day"
         )
         response = await ask_claude(prompt)
         await update.message.reply_text(response, parse_mode="Markdown")
 
     else:
+        # food_question, general question, or anything else
         today_events = get_todays_events()
         totals_today = get_daily_totals(date.today().isoformat())
+        meals_today = get_daily_log(date.today().isoformat())
         last_checkin_data = get_last_checkin()
-        prompt = build_coach_prompt(text, today_events, totals_today, last_checkin_data)
+        prompt = build_coach_prompt(text, today_events, totals_today, meals_today, last_checkin_data)
         response = await ask_claude(prompt)
         await update.message.reply_text(response, parse_mode="Markdown")
 
 
+# ── Food log processor (shared by /log command and smart handler) ────────────
+async def process_food_log(update: Update, text: str):
+    totals_before = get_daily_totals(date.today().isoformat())
+    prompt = (
+        f"Krisz just ate: '{text}'\n"
+        f"Today's running totals so far: {json.dumps(totals_before)}\n"
+        f"Daily targets: 2155 kcal, 124g protein (135g on training days).\n\n"
+        f"Estimate the calories and protein in what she just ate. Be realistic — don't low-ball.\n"
+        f"Reply in this EXACT format with no extra text:\n"
+        f"CALORIES: [number]\n"
+        f"PROTEIN: [number]\n"
+        f"COMMENT: [one short sentence about running totals or protein gap]"
+    )
+    response = await ask_claude(prompt)
+    lines = response.strip().split("\n")
+    cal = prot = 0
+    comment = ""
+    for line in lines:
+        if line.startswith("CALORIES:"):
+            try: cal = int(line.split(":")[1].strip())
+            except: pass
+        elif line.startswith("PROTEIN:"):
+            try: prot = int(line.split(":")[1].strip())
+            except: pass
+        elif line.startswith("COMMENT:"):
+            comment = line.split(":", 1)[1].strip()
+
+    if cal > 0:
+        log_meal(date.today().isoformat(), text, cal, prot)
+        new_totals = get_daily_totals(date.today().isoformat())
+        await update.message.reply_text(
+            f"✅ Logged: *{text}*\n"
+            f"~{cal} kcal · {prot}g protein\n\n"
+            f"📊 *Today so far:* {new_totals['calories']} kcal · {new_totals['protein']}g protein\n\n"
+            f"_{comment}_",
+            parse_mode="Markdown"
+        )
+    else:
+        await update.message.reply_text(
+            f"Couldn't estimate calories for '{text}'. Try being more specific, e.g. '150g chicken breast'."
+        )
+
+
+# ── Delete today's meals from DB ─────────────────────────────────────────────
+def delete_todays_meals():
+    from database import get_conn
+    conn = get_conn()
+    conn.execute("DELETE FROM meals WHERE date = ?", (date.today().isoformat(),))
+    conn.commit()
+    conn.close()
+
+
 # ── Prompt builders ──────────────────────────────────────────────────────────
-def build_daily_prompt(today_events, tomorrow_events, totals, fridge, last_checkin, wfh, mode):
+def build_daily_prompt(today_events, tomorrow_events, totals, meals, fridge, last_checkin, wfh, mode):
     today_str = date.today().strftime("%A %d %B")
     wfh_str = "working from home" if wfh else ("in the office (Mariahilfer Strasse 54)" if wfh is False else "unknown — assume WFH")
+
+    meals_str = ""
+    if meals:
+        meals_str = "\n".join([f"- {m['description']}: {m['calories']} kcal, {m['protein']}g protein" for m in meals])
+    else:
+        meals_str = "Nothing logged yet"
 
     return (
         f"You are Krisz's personal trainer and nutritionist. Today is {today_str}. "
@@ -531,7 +583,8 @@ def build_daily_prompt(today_events, tomorrow_events, totals, fridge, last_check
         f"CALENDAR TODAY: {json.dumps(today_events)}\n"
         f"CALENDAR TOMORROW: {json.dumps(tomorrow_events)}\n"
         f"FOOD AT HOME: {fridge or 'not updated this week'}\n"
-        f"TODAY'S NUTRITION SO FAR: {json.dumps(totals)}\n"
+        f"TODAY'S NUTRITION TOTALS: {json.dumps(totals)}\n"
+        f"TODAY'S LOGGED MEALS:\n{meals_str}\n"
         f"LAST BODY CHECK-IN: {json.dumps(last_checkin)}\n\n"
         f"KRISZ'S PROFILE:\n"
         f"- Training for a half marathon (Runna plan), Ashtanga yoga = strength training not light activity\n"
@@ -544,22 +597,30 @@ def build_daily_prompt(today_events, tomorrow_events, totals, fridge, last_check
         f"1. Training today (from calendar or recommended — be specific)\n"
         f"2. Nutrition approach for today (meals from fridge if WFH, simple options if office)\n"
         f"3. Key reminders based on tomorrow's calendar (pack bag, alarm time, pre-run fuel)\n\n"
-        f"Keep it concise. Use *bold* for section headers. No bullet soup."
+        f"FORMATTING RULES: Use *bold* for section labels only. No ## headers. No bullet soup. Keep it concise."
     )
 
 
-def build_coach_prompt(question, today_events, totals, last_checkin):
+def build_coach_prompt(question, today_events, totals, meals, last_checkin):
     today_str = date.today().strftime("%A %d %B")
+
+    meals_str = ""
+    if meals:
+        meals_str = "\n".join([f"- {m['description']}: {m['calories']} kcal, {m['protein']}g protein" for m in meals])
+    else:
+        meals_str = "Nothing logged yet"
+
     return (
         f"You are Krisz's personal trainer and nutritionist. Today is {today_str}.\n"
         f"CALENDAR TODAY: {json.dumps(today_events)}\n"
-        f"TODAY'S NUTRITION: {json.dumps(totals)}\n"
+        f"TODAY'S NUTRITION TOTALS: {json.dumps(totals)}\n"
+        f"TODAY'S LOGGED MEALS:\n{meals_str}\n"
         f"LAST CHECK-IN: {json.dumps(last_checkin)}\n\n"
         f"PROFILE: Training for half marathon + Ashtanga (strength). "
         f"Targets: 2155 kcal, 124g protein. Goal: recomposition. "
         f"Tone: direct, no fluff.\n\n"
-        f"Her question: {question}\n\n"
-        f"Answer directly and concisely."
+        f"Her question or message: {question}\n\n"
+        f"Answer directly and concisely. Use *bold* sparingly. No ## headers."
     )
 
 
@@ -574,6 +635,8 @@ def main():
     app.add_handler(CommandHandler("today", today))
     app.add_handler(CommandHandler("log", log_food))
     app.add_handler(CommandHandler("totals", totals))
+    app.add_handler(CommandHandler("meals", meals_command))
+    app.add_handler(CommandHandler("reset", reset_command))
     app.add_handler(CommandHandler("fridge", fridge_command))
     app.add_handler(CommandHandler("checkin", checkin))
     app.add_handler(CommandHandler("week", week))
