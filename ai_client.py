@@ -34,7 +34,7 @@ async def ask_claude(user_prompt: str, max_tokens: int = 600) -> str:
     """Send a prompt to Claude and return the text response."""
     try:
         message = client.messages.create(
-            model="claude-sonnet-4-20250514",
+            model="claude-sonnet-4-5",
             max_tokens=max_tokens,
             system=SYSTEM_PROMPT,
             messages=[{"role": "user", "content": user_prompt}]
