@@ -124,7 +124,6 @@ async def log_food(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     response = await ask_claude(prompt)
 
-    # Parse structured response
     lines = response.strip().split("\n")
     cal = prot = 0
     comment = ""
@@ -218,8 +217,6 @@ async def fridge_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     set_fridge(text)
-
-    # Ask Claude for a quick meal plan based on contents
     prompt = (
         f"Krisz has the following food at home: {text}\n"
         f"Her targets: ~2155 kcal/day, 124g protein. She likes simple meals — salads, beans, "
@@ -319,16 +316,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Handle WFH/office morning response
     if context.user_data.get("awaiting_wfh"):
-        wfh = "home" in text.lower() or "wfh" in text.lower() or "home" in text.lower()
+        wfh = "home" in text.lower() or "wfh" in text.lower()
         context.user_data["wfh_today"] = wfh
         context.user_data.pop("awaiting_wfh", None)
-
         today_events = get_todays_events()
         tomorrow_events = get_tomorrows_events()
         totals_today = get_daily_totals(date.today().isoformat())
         fridge = get_fridge()
         last_checkin_data = get_last_checkin()
-
         prompt = build_daily_prompt(
             today_events, tomorrow_events, totals_today,
             fridge, last_checkin_data, wfh, mode="full_day"
@@ -337,10 +332,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(response, parse_mode="Markdown")
         return
 
-    # Smart intent detection — figure out what Krisz is doing
+    # Smart intent detection
     await handle_smart_message(update, context, text)
 
 
+# ── Check-in data parser ─────────────────────────────────────────────────────
 async def handle_checkin_data(update, context, text):
     import re
     weight = muscle = fat = None
@@ -386,7 +382,7 @@ async def handle_checkin_data(update, context, text):
     )
 
 
-# ── Voice message handler ─────────────────────────────────────────────────────
+# ── Voice message handler ────────────────────────────────────────────────────
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorised(update): return
 
@@ -395,46 +391,40 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         from faster_whisper import WhisperModel
 
-# Download voice file from Telegram
-voice = update.message.voice
-file = await context.bot.get_file(voice.file_id)
+        voice = update.message.voice
+        file = await context.bot.get_file(voice.file_id)
 
-with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
-    tmp_path = tmp.name
+        with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
+            tmp_path = tmp.name
 
-await file.download_to_drive(tmp_path)
+        await file.download_to_drive(tmp_path)
 
-# Transcribe with faster-whisper
-model = WhisperModel("tiny", device="cpu", compute_type="int8")
-segments, _ = model.transcribe(tmp_path)
-text = " ".join([s.text for s in segments]).strip()
+        model = WhisperModel("tiny", device="cpu", compute_type="int8")
+        segments, _ = model.transcribe(tmp_path)
+        text = " ".join([s.text for s in segments]).strip()
 
-# Clean up temp file
-os.unlink(tmp_path)
+        os.unlink(tmp_path)
+
         if not text:
             await update.message.reply_text("Couldn't make out what you said — try again?")
             return
 
         await update.message.reply_text(f"_Heard: {text}_", parse_mode="Markdown")
-
-        # Route through same smart intent detection as text messages
         await handle_smart_message(update, context, text)
 
     except ImportError:
-    await update.message.reply_text(
-        "⚠️ Whisper isn't installed. Ask Krisz to add `faster-whisper` to requirements.txt."
-    )
+        await update.message.reply_text(
+            "⚠️ faster-whisper isn't installed. Add `faster-whisper==1.0.3` to requirements.txt."
         )
     except Exception as e:
         logger.error(f"Voice transcription error: {e}")
         await update.message.reply_text(
             "Something went wrong transcribing that. Try typing it instead."
         )
+
+
+# ── Smart intent detection ───────────────────────────────────────────────────
 async def handle_smart_message(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
-    """
-    Uses Claude to classify what Krisz is trying to do, then routes accordingly.
-    Intents: food_log, weight_checkin, fridge_update, wfh_response, question
-    """
     intent_prompt = (
         f"Classify this message from Krisz into exactly one of these intents:\n"
         f"- food_log: she is telling you what she ate or drank\n"
@@ -448,7 +438,6 @@ async def handle_smart_message(update: Update, context: ContextTypes.DEFAULT_TYP
     intent = (await ask_claude(intent_prompt, max_tokens=20)).strip().lower()
 
     if "food_log" in intent:
-        # Route to food logging logic
         totals_before = get_daily_totals(date.today().isoformat())
         prompt = (
             f"The user just logged this meal: '{text}'\n"
@@ -486,7 +475,9 @@ async def handle_smart_message(update: Update, context: ContextTypes.DEFAULT_TYP
                 parse_mode="Markdown"
             )
         else:
-            await update.message.reply_text(f"Noted '{text}' but couldn't estimate calories. Try being more specific.")
+            await update.message.reply_text(
+                f"Noted '{text}' but couldn't estimate calories. Try being more specific."
+            )
 
     elif "weight_checkin" in intent:
         await handle_checkin_data(update, context, text)
@@ -521,7 +512,6 @@ async def handle_smart_message(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text(response, parse_mode="Markdown")
 
     else:
-        # General question or conversation
         today_events = get_todays_events()
         totals_today = get_daily_totals(date.today().isoformat())
         last_checkin_data = get_last_checkin()
