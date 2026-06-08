@@ -393,25 +393,24 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🎙 Got it, transcribing...")
 
     try:
-        import whisper
+        from faster_whisper import WhisperModel
 
-        # Download voice file from Telegram
-        voice = update.message.voice
-        file = await context.bot.get_file(voice.file_id)
+# Download voice file from Telegram
+voice = update.message.voice
+file = await context.bot.get_file(voice.file_id)
 
-        with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
-            tmp_path = tmp.name
+with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
+    tmp_path = tmp.name
 
-        await file.download_to_drive(tmp_path)
+await file.download_to_drive(tmp_path)
 
-        # Transcribe with Whisper
-        model = whisper.load_model("tiny")  # tiny = fast, good enough for short messages
-        result = model.transcribe(tmp_path)
-        text = result["text"].strip()
+# Transcribe with faster-whisper
+model = WhisperModel("tiny", device="cpu", compute_type="int8")
+segments, _ = model.transcribe(tmp_path)
+text = " ".join([s.text for s in segments]).strip()
 
-        # Clean up temp file
-        os.unlink(tmp_path)
-
+# Clean up temp file
+os.unlink(tmp_path)
         if not text:
             await update.message.reply_text("Couldn't make out what you said — try again?")
             return
@@ -422,8 +421,9 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await handle_smart_message(update, context, text)
 
     except ImportError:
-        await update.message.reply_text(
-            "⚠️ Whisper isn't installed. Ask Krisz to add `openai-whisper` to requirements.txt."
+    await update.message.reply_text(
+        "⚠️ Whisper isn't installed. Ask Krisz to add `faster-whisper` to requirements.txt."
+    )
         )
     except Exception as e:
         logger.error(f"Voice transcription error: {e}")
