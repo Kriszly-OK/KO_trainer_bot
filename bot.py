@@ -336,13 +336,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(response, parse_mode="Markdown")
         return
 
-    # General free-form — treat as /ask
-    today_events = get_todays_events()
-    totals_today = get_daily_totals(date.today().isoformat())
-    last_checkin_data = get_last_checkin()
-    prompt = build_coach_prompt(text, today_events, totals_today, last_checkin_data)
-    response = await ask_claude(prompt)
-    await update.message.reply_text(response, parse_mode="Markdown")
+    # Smart intent detection — figure out what Krisz is doing
+    await handle_smart_message(update, context, text)
 
 
 async def handle_checkin_data(update, context, text):
@@ -388,6 +383,107 @@ async def handle_checkin_data(update, context, text):
         f"✅ Check-in logged: {details}\n\n{assessment}",
         parse_mode="Markdown"
     )
+
+
+# ── Smart intent detection ───────────────────────────────────────────────────
+async def handle_smart_message(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
+    """
+    Uses Claude to classify what Krisz is trying to do, then routes accordingly.
+    Intents: food_log, weight_checkin, fridge_update, wfh_response, question
+    """
+    intent_prompt = (
+        f"Classify this message from Krisz into exactly one of these intents:\n"
+        f"- food_log: she is telling you what she ate or drank\n"
+        f"- weight_checkin: she is sharing her weight, body fat, or muscle percentage\n"
+        f"- fridge_update: she is listing food she has at home\n"
+        f"- wfh_response: she is saying whether she is working from home or the office today\n"
+        f"- question: she is asking something or having a general conversation\n\n"
+        f"Message: '{text}'\n\n"
+        f"Reply with ONLY the intent word, nothing else."
+    )
+    intent = (await ask_claude(intent_prompt, max_tokens=20)).strip().lower()
+
+    if "food_log" in intent:
+        # Route to food logging logic
+        totals_before = get_daily_totals(date.today().isoformat())
+        prompt = (
+            f"The user just logged this meal: '{text}'\n"
+            f"Today's running totals so far: {json.dumps(totals_before)}\n"
+            f"Daily targets: 2155 kcal, 124g protein (135g on training days).\n\n"
+            f"Estimate the calories and protein in this meal. Be realistic — don't low-ball.\n"
+            f"Reply in this exact format:\n"
+            f"CALORIES: [number]\n"
+            f"PROTEIN: [number]\n"
+            f"COMMENT: [one short sentence — running total context, flag if getting close to limit, "
+            f"or note if protein is low for the meal]"
+        )
+        response = await ask_claude(prompt)
+        lines = response.strip().split("\n")
+        cal = prot = 0
+        comment = ""
+        for line in lines:
+            if line.startswith("CALORIES:"):
+                try: cal = int(line.split(":")[1].strip())
+                except: pass
+            elif line.startswith("PROTEIN:"):
+                try: prot = int(line.split(":")[1].strip())
+                except: pass
+            elif line.startswith("COMMENT:"):
+                comment = line.split(":", 1)[1].strip()
+
+        if cal > 0:
+            log_meal(date.today().isoformat(), text, cal, prot)
+            new_totals = get_daily_totals(date.today().isoformat())
+            await update.message.reply_text(
+                f"✅ Logged: *{text}*\n"
+                f"~{cal} kcal · {prot}g protein\n\n"
+                f"📊 *Today so far:* {new_totals['calories']} kcal · {new_totals['protein']}g protein\n\n"
+                f"_{comment}_",
+                parse_mode="Markdown"
+            )
+        else:
+            await update.message.reply_text(f"Noted '{text}' but couldn't estimate calories. Try being more specific.")
+
+    elif "weight_checkin" in intent:
+        await handle_checkin_data(update, context, text)
+
+    elif "fridge_update" in intent:
+        set_fridge(text)
+        prompt = (
+            f"Krisz has the following food at home: {text}\n"
+            f"Her targets: ~2155 kcal/day, 124g protein. She likes simple meals — salads, beans, "
+            f"lentils, a protein source. Gets bored of meal prep. Prefers variety.\n"
+            f"Suggest 3 simple meals she could make this week. One line each. Practical, not aspirational."
+        )
+        suggestions = await ask_claude(prompt)
+        await update.message.reply_text(
+            f"✅ Fridge updated.\n\n🍽 *Meal ideas from what you have:*\n{suggestions}",
+            parse_mode="Markdown"
+        )
+
+    elif "wfh_response" in intent:
+        wfh = any(w in text.lower() for w in ["home", "wfh", "remote"])
+        context.user_data["wfh_today"] = wfh
+        today_events = get_todays_events()
+        tomorrow_events = get_tomorrows_events()
+        totals_today = get_daily_totals(date.today().isoformat())
+        fridge = get_fridge()
+        last_checkin_data = get_last_checkin()
+        prompt = build_daily_prompt(
+            today_events, tomorrow_events, totals_today,
+            fridge, last_checkin_data, wfh, mode="full_day"
+        )
+        response = await ask_claude(prompt)
+        await update.message.reply_text(response, parse_mode="Markdown")
+
+    else:
+        # General question or conversation
+        today_events = get_todays_events()
+        totals_today = get_daily_totals(date.today().isoformat())
+        last_checkin_data = get_last_checkin()
+        prompt = build_coach_prompt(text, today_events, totals_today, last_checkin_data)
+        response = await ask_claude(prompt)
+        await update.message.reply_text(response, parse_mode="Markdown")
 
 
 # ── Prompt builders ──────────────────────────────────────────────────────────
