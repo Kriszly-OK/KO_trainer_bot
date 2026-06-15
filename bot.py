@@ -489,8 +489,11 @@ async def handle_smart_message(update: Update, context: ContextTypes.DEFAULT_TYP
         f"- fridge_update: listing food she has at home\n"
         f"- wfh_response: saying whether working from home or office today\n"
         f"- schedule_correction: correcting or clarifying something about TODAY's schedule or "
-        f"training (e.g. 'I don't have training today', 'that run was yesterday', "
-        f"'I'm not doing the gym today', 'no training scheduled')\n"
+        f"training that was WRONG on the calendar (e.g. 'I don't have training today', "
+        f"'that run was yesterday', 'no training scheduled')\n"
+        f"- missed_training: she SKIPPED or DIDN'T DO a training session that WAS correctly "
+        f"scheduled (e.g. 'I missed my run today', 'didn't get to my run', 'skipped training', "
+        f"'couldn't do the run')\n"
         f"- question: anything else\n\n"
         f"Message: '{clean_text}'\n\n"
         f"Reply with ONLY the intent word."
@@ -526,6 +529,13 @@ async def handle_smart_message(update: Update, context: ContextTypes.DEFAULT_TYP
 
     elif "fridge_update" in intent:
         await process_fridge_update(update, clean_text)
+
+    elif "missed_training" in intent:
+        set_today_override(
+            date.today().isoformat(),
+            f"Missed/skipped a scheduled training session today: {clean_text}"
+        )
+        await handle_missed_training(update, clean_text)
 
     elif "schedule_correction" in intent:
         set_today_override(date.today().isoformat(), clean_text)
@@ -640,6 +650,40 @@ async def process_fridge_update(update: Update, text: str):
         f"✅ Fridge updated.\n\n🍽 *Meal ideas:*\n{suggestions}",
         parse_mode="Markdown"
     )
+
+
+# ── Missed training handler ──────────────────────────────────────────────────
+async def handle_missed_training(update: Update, text: str):
+    """When Krisz reports a missed/skipped session, suggest where to fit it back in this week."""
+    week_events = get_week_events()
+
+    summary_lines = []
+    for i, (day_label, events) in enumerate(week_events.items()):
+        weekday = (datetime.now(VIENNA_TZ).weekday() + i) % 7
+        is_wfh = weekday in WFH_DAYS
+        training = [e for e in events if e.get("type") == "training"]
+        free = get_free_windows(events)
+
+        training_str = ", ".join([e["summary"] for e in training]) if training else "none"
+        free_str = ", ".join([f"{w['start']}–{w['end']} ({w['minutes']}min)" for w in free[:3]]) if free else "none"
+        tag = "TODAY" if i == 0 else ("WFH" if is_wfh else "office")
+        summary_lines.append(f"{day_label} [{tag}]: training={training_str}; free windows={free_str}")
+
+    prompt = (
+        f"Krisz just told her trainer: '{text}'\n"
+        f"This means she skipped/missed a training session that was scheduled for today.\n\n"
+        f"Rest of week calendar:\n" + "\n".join(summary_lines) + "\n\n"
+        f"PROFILE: Half marathon training block, Ashtanga = strength training. "
+        f"On office days (Tue/Wed/Thu), training only fits before ~6:30am "
+        f"(needs {OFFICE_BUFFER_MINUTES}min buffer for prep+commute after training+shower) "
+        f"or after ~18:30. On WFH days (Mon/Fri) it fits in day gaps.\n\n"
+        f"Suggest the best 1-2 days/times this week to fit in the missed session. "
+        f"Avoid stacking it right before or after an already-hard session if possible. "
+        f"Be specific about day and time window. 2-3 sentences max. No fluff, no headers, "
+        f"do NOT ask follow-up questions."
+    )
+    response = await ask_claude(prompt, max_tokens=300)
+    await update.message.reply_text(f"No worries — noted.\n\n{response}", parse_mode="Markdown")
 
 
 # ── Prompt builders ──────────────────────────────────────────────────────────
