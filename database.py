@@ -16,7 +16,6 @@ USE_POSTGRES = bool(DATABASE_URL)
 def get_conn():
     if USE_POSTGRES:
         import psycopg2
-        import psycopg2.extras
         conn = psycopg2.connect(DATABASE_URL)
         return conn
     else:
@@ -26,28 +25,11 @@ def get_conn():
         return conn
 
 
-def execute(conn, sql, params=()):
-    """Unified execute that works for both Postgres and SQLite."""
-    if USE_POSTGRES:
-        # Postgres uses %s placeholders, SQLite uses ?
-        sql = sql.replace("?", "%s")
-        # Postgres uses SERIAL not AUTOINCREMENT
-        sql = sql.replace("AUTOINCREMENT", "")
-        # Postgres uses ON CONFLICT DO UPDATE
-        sql = sql.replace(
-            "INSERT OR REPLACE INTO config",
-            "INSERT INTO config"
-        )
-    cur = conn.cursor()
-    cur.execute(sql, params)
-    return cur
-
-
 def init_db():
     conn = get_conn()
     try:
+        cur = conn.cursor()
         if USE_POSTGRES:
-            cur = conn.cursor()
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS meals (
                     id SERIAL PRIMARY KEY,
@@ -55,9 +37,13 @@ def init_db():
                     description TEXT,
                     calories INTEGER DEFAULT 0,
                     protein INTEGER DEFAULT 0,
+                    fiber INTEGER DEFAULT 0,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+            # Add fiber column if table already existed without it
+            cur.execute("ALTER TABLE meals ADD COLUMN IF NOT EXISTS fiber INTEGER DEFAULT 0")
+
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS checkins (
                     id SERIAL PRIMARY KEY,
@@ -90,7 +76,6 @@ def init_db():
                 )
             """)
         else:
-            cur = conn.cursor()
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS meals (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -98,9 +83,15 @@ def init_db():
                     description TEXT,
                     calories INTEGER DEFAULT 0,
                     protein INTEGER DEFAULT 0,
+                    fiber INTEGER DEFAULT 0,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+            try:
+                cur.execute("ALTER TABLE meals ADD COLUMN fiber INTEGER DEFAULT 0")
+            except Exception:
+                pass  # column already exists
+
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS checkins (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -140,19 +131,19 @@ def init_db():
 
 
 # ── Meals ────────────────────────────────────────────────────────────────────
-def log_meal(date_str: str, description: str, calories: int, protein: int):
+def log_meal(date_str: str, description: str, calories: int, protein: int, fiber: int = 0):
     conn = get_conn()
     try:
         cur = conn.cursor()
         if USE_POSTGRES:
             cur.execute(
-                "INSERT INTO meals (date, description, calories, protein) VALUES (%s, %s, %s, %s)",
-                (date_str, description, calories, protein)
+                "INSERT INTO meals (date, description, calories, protein, fiber) VALUES (%s, %s, %s, %s, %s)",
+                (date_str, description, calories, protein, fiber)
             )
         else:
             cur.execute(
-                "INSERT INTO meals (date, description, calories, protein) VALUES (?, ?, ?, ?)",
-                (date_str, description, calories, protein)
+                "INSERT INTO meals (date, description, calories, protein, fiber) VALUES (?, ?, ?, ?, ?)",
+                (date_str, description, calories, protein, fiber)
             )
         conn.commit()
     finally:
@@ -165,20 +156,20 @@ def get_daily_totals(date_str: str) -> dict:
         cur = conn.cursor()
         if USE_POSTGRES:
             cur.execute(
-                "SELECT COALESCE(SUM(calories),0) as calories, COALESCE(SUM(protein),0) as protein "
+                "SELECT COALESCE(SUM(calories),0), COALESCE(SUM(protein),0), COALESCE(SUM(fiber),0) "
                 "FROM meals WHERE date = %s",
                 (date_str,)
             )
+            row = cur.fetchone()
+            return {"calories": row[0], "protein": row[1], "fiber": row[2]}
         else:
             cur.execute(
-                "SELECT COALESCE(SUM(calories),0) as calories, COALESCE(SUM(protein),0) as protein "
-                "FROM meals WHERE date = ?",
+                "SELECT COALESCE(SUM(calories),0) as calories, COALESCE(SUM(protein),0) as protein, "
+                "COALESCE(SUM(fiber),0) as fiber FROM meals WHERE date = ?",
                 (date_str,)
             )
-        row = cur.fetchone()
-        if USE_POSTGRES:
-            return {"calories": row[0], "protein": row[1]}
-        return {"calories": row["calories"], "protein": row["protein"]}
+            row = cur.fetchone()
+            return {"calories": row["calories"], "protein": row["protein"], "fiber": row["fiber"]}
     finally:
         conn.close()
 
@@ -189,13 +180,13 @@ def get_daily_log(date_str: str) -> list:
         cur = conn.cursor()
         if USE_POSTGRES:
             cur.execute(
-                "SELECT description, calories, protein FROM meals WHERE date = %s ORDER BY created_at",
+                "SELECT description, calories, protein, fiber FROM meals WHERE date = %s ORDER BY created_at",
                 (date_str,)
             )
-            return [{"description": r[0], "calories": r[1], "protein": r[2]} for r in cur.fetchall()]
+            return [{"description": r[0], "calories": r[1], "protein": r[2], "fiber": r[3]} for r in cur.fetchall()]
         else:
             cur.execute(
-                "SELECT description, calories, protein FROM meals WHERE date = ? ORDER BY created_at",
+                "SELECT description, calories, protein, fiber FROM meals WHERE date = ? ORDER BY created_at",
                 (date_str,)
             )
             return [dict(r) for r in cur.fetchall()]
@@ -267,11 +258,10 @@ def set_fridge(contents: str):
     conn = get_conn()
     try:
         cur = conn.cursor()
+        cur.execute("DELETE FROM fridge")
         if USE_POSTGRES:
-            cur.execute("DELETE FROM fridge")
             cur.execute("INSERT INTO fridge (id, contents) VALUES (%s, %s)", (1, contents))
         else:
-            cur.execute("DELETE FROM fridge")
             cur.execute("INSERT INTO fridge (id, contents) VALUES (1, ?)", (contents,))
         conn.commit()
     finally:
@@ -282,10 +272,7 @@ def get_fridge() -> str:
     conn = get_conn()
     try:
         cur = conn.cursor()
-        if USE_POSTGRES:
-            cur.execute("SELECT contents FROM fridge WHERE id = 1")
-        else:
-            cur.execute("SELECT contents FROM fridge WHERE id = 1")
+        cur.execute("SELECT contents FROM fridge WHERE id = 1")
         row = cur.fetchone()
         if row:
             return row[0] if USE_POSTGRES else row["contents"]
@@ -294,7 +281,7 @@ def get_fridge() -> str:
         conn.close()
 
 
-# ── Config ───────────────────────────────────────────────────────────────────
+# ── Config (generic key/value store) ─────────────────────────────────────────
 def set_config(key: str, value: str):
     conn = get_conn()
     try:
@@ -329,6 +316,17 @@ def get_config(key: str) -> str:
         return None
     finally:
         conn.close()
+
+
+# ── Schedule overrides (daily corrections to calendar) ───────────────────────
+def set_today_override(date_str: str, text: str):
+    """Store a correction Krisz made about today's schedule/training."""
+    set_config(f"override_{date_str}", text)
+
+
+def get_today_override(date_str: str) -> str:
+    """Retrieve any correction Krisz made about today's schedule/training."""
+    return get_config(f"override_{date_str}")
 
 
 # ── Delete today's meals ─────────────────────────────────────────────────────
