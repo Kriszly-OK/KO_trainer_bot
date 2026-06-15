@@ -7,7 +7,7 @@ import os
 import logging
 import json
 import tempfile
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 import pytz
 
 from telegram import Update
@@ -25,7 +25,7 @@ from database import (
     init_db, log_meal, get_daily_totals, get_config,
     set_config, log_checkin, get_last_checkin,
     set_fridge, get_fridge, add_to_daily_log, get_daily_log,
-    delete_todays_meals
+    delete_todays_meals, set_today_override, get_today_override
 )
 from ai_client import ask_claude
 
@@ -39,8 +39,18 @@ VIENNA_TZ = pytz.timezone("Europe/Vienna")
 AUTHORISED_USERNAME = "kriszly"
 
 # WFH schedule — Mon=0, Fri=4 are WFH by default
-WFH_DAYS = {0, 4}  # Monday, Friday
-OFFICE_DAYS = {1, 2, 3}  # Tuesday, Wednesday, Thursday
+WFH_DAYS = {0, 4}
+OFFICE_DAYS = {1, 2, 3}
+
+# Morning routine constants (used in prompts so Claude's timing advice is consistent
+# with what the scheduler calculates)
+COMMUTE_MINUTES = 45
+MORNING_PREP_MINUTES = 40  # skincare, meds, breakfast
+OFFICE_BUFFER_MINUTES = COMMUTE_MINUTES + MORNING_PREP_MINUTES  # 85
+WFH_BUFFER_MINUTES = 15
+
+FIBER_TARGET = 30  # general daily guideline, not a strict target like protein
+
 
 def is_authorised(update: Update) -> bool:
     return update.effective_user.username == AUTHORISED_USERNAME
@@ -49,13 +59,11 @@ def is_wfh_today() -> bool:
     return datetime.now(VIENNA_TZ).weekday() in WFH_DAYS
 
 def get_wfh_status(context_override=None) -> bool:
-    """Return WFH status — context override wins, otherwise use weekly default."""
     if context_override is not None:
         return context_override
     return is_wfh_today()
 
 def strip_heard_prefix(text: str) -> str:
-    """Remove 'Heard: ' prefix that appears in voice-transcribed messages."""
     if text.startswith("Heard:"):
         text = text[6:].strip()
     return text
@@ -78,7 +86,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Hey Krisz! Targets pre-loaded:\n\n"
         "📊 *Targets*\n"
         "• Calories: 2,155 (rest days ~1,900)\n"
-        "• Protein: 124g baseline, 135g+ on training days\n\n"
+        "• Protein: 124g baseline, 135g+ on training days\n"
+        f"• Fiber: ~{FIBER_TARGET}g/day (general guideline)\n\n"
         "One question to finish setup:\n\n"
         "What's your current weight in kg?",
         parse_mode="Markdown"
@@ -93,15 +102,16 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🤖 *K O Trainer Bot — Commands*\n\n"
         "/today — Today's training + nutrition plan\n"
         "/log [food] — Log a meal\n"
-        "/totals — Today's calorie & protein totals\n"
+        "/totals — Today's calorie, protein & fiber totals\n"
         "/meals — Show all meals logged today\n"
         "/reset — Clear today's food log\n"
         "/fridge — Update your fridge inventory\n"
         "/checkin — Log weekly weight & body comp\n"
         "/week — Full week training + schedule overview\n"
         "/ask [question] — Ask your trainer anything\n"
-        "/help — This message",
-        parse_mode="Markdown"
+        "/help — This message\n\n"
+        "_Tip: if I get something about today's schedule wrong, just tell me "
+        "(e.g. \"I don't have training today\") and I'll adjust for the rest of the day._"
     )
 
 
@@ -113,6 +123,7 @@ async def today(update: Update, context: ContextTypes.DEFAULT_TYPE):
     today_events = get_todays_events()
     tomorrow_events = get_tomorrows_events()
     free_windows = get_free_windows(today_events, day_offset=0)
+    tomorrow_free_windows = get_free_windows(tomorrow_events, day_offset=1)
     totals = get_daily_totals(date.today().isoformat())
     meals = get_daily_log(date.today().isoformat())
     fridge = get_fridge()
@@ -120,10 +131,10 @@ async def today(update: Update, context: ContextTypes.DEFAULT_TYPE):
     wfh = get_wfh_status(context.user_data.get("wfh_today"))
 
     prompt = build_daily_prompt(
-        today_events, tomorrow_events, free_windows,
+        today_events, tomorrow_events, free_windows, tomorrow_free_windows,
         totals, meals, fridge, last_checkin, wfh
     )
-    response = await ask_claude(prompt)
+    response = await ask_claude(prompt, max_tokens=800)
     await update.message.reply_text(response, parse_mode="Markdown")
 
 
@@ -144,9 +155,12 @@ async def meals_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not meals:
         await update.message.reply_text("Nothing logged yet today.")
         return
-    lines = [f"• {m['description']} — {m['calories']} kcal · {m['protein']}g protein" for m in meals]
+    lines = [
+        f"• {m['description']} — {m['calories']} kcal · {m['protein']}g protein · {m.get('fiber', 0)}g fiber"
+        for m in meals
+    ]
     t = get_daily_totals(date.today().isoformat())
-    lines.append(f"\n*Total: {t['calories']} kcal · {t['protein']}g protein*")
+    lines.append(f"\n*Total: {t['calories']} kcal · {t['protein']}g protein · {t.get('fiber', 0)}g fiber*")
     await update.message.reply_text(
         "*Today's logged meals:*\n\n" + "\n".join(lines),
         parse_mode="Markdown"
@@ -169,10 +183,12 @@ async def totals_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     t = get_daily_totals(date.today().isoformat())
     cal = t.get("calories", 0)
     prot = t.get("protein", 0)
+    fiber = t.get("fiber", 0)
     cal_target = 2155
     prot_target = 124
     cal_pct = round((cal / cal_target) * 100)
     prot_pct = round((prot / prot_target) * 100)
+    fiber_pct = round((fiber / FIBER_TARGET) * 100)
     now_hour = datetime.now(VIENNA_TZ).hour
     time_context = "morning" if now_hour < 12 else "afternoon" if now_hour < 17 else "evening"
 
@@ -184,6 +200,8 @@ async def totals_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"💪 Protein: {prot} / {prot_target}g ({prot_pct}%)\n"
         f"   {'▓' * min(prot_pct//10, 10)}{'░' * max(0, 10 - prot_pct//10)}\n"
         f"   {prot_target - prot}g remaining\n\n"
+        f"🌾 Fiber: {fiber} / ~{FIBER_TARGET}g ({fiber_pct}%)\n"
+        f"   {'▓' * min(fiber_pct//10, 10)}{'░' * max(0, 10 - fiber_pct//10)}\n\n"
         f"_{get_totals_comment(cal, prot, cal_target, prot_target, time_context)}_",
         parse_mode="Markdown"
     )
@@ -243,7 +261,6 @@ async def week(update: Update, context: ContextTypes.DEFAULT_TYPE):
     fridge = get_fridge()
     last_checkin = get_last_checkin()
 
-    # Build a readable week summary
     week_summary = []
     for day_label, events in week_events.items():
         training = [e for e in events if e.get("type") == "training"]
@@ -277,7 +294,6 @@ async def week(update: Update, context: ContextTypes.DEFAULT_TYPE):
             day_str += f"\n  Free windows: {', '.join(windows)}"
         week_summary.append(day_str)
 
-    # Determine WFH pattern for the week
     wfh_note = "WFH: Monday, Friday. Office: Tuesday, Wednesday, Thursday."
 
     prompt = (
@@ -289,16 +305,20 @@ async def week(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"LAST CHECK-IN: {json.dumps(last_checkin)}\n\n"
         f"KRISZ'S PROFILE:\n"
         f"- Half marathon Runna training block. Ashtanga = strength training.\n"
-        f"- Runna events in calendar are all-day events with no fixed time — suggest the best time slot based on her day.\n"
-        f"- On WFH days: runs can fit between calendar gaps during the day.\n"
-        f"- On office days: runs only before 8am or after 18:30.\n"
-        f"- Busy blocks are work meetings — treat as immovable.\n\n"
+        f"- Runna events in calendar are all-day events with no fixed time — suggest the best time slot.\n"
+        f"- WFH days (Mon/Fri): runs fit in calendar gaps during the day.\n"
+        f"- Office days (Tue/Wed/Thu): runs only before ~6:30am (need {OFFICE_BUFFER_MINUTES}min "
+        f"before first meeting for run+shower+commute+prep) or after ~18:30.\n"
+        f"- Busy blocks are work meetings — immovable.\n"
+        f"- On days with no run scheduled, suggest Ashtanga yoga (60min incl. setup) if there's a "
+        f"free window of 75+ minutes.\n\n"
         f"Provide:\n"
-        f"1. For each day with a Runna event: the run details and the best suggested time window\n"
-        f"2. Best days for Ashtanga if not already scheduled\n"
+        f"1. For each day with a Runna event: the run details and best suggested time window\n"
+        f"2. Best days for Ashtanga if not already covered above\n"
         f"3. Any nutrition notes for heavy training days\n"
         f"4. One thing to watch this week\n\n"
-        f"Be specific and practical. Use *bold* for day names only. No ## headers. No fluff."
+        f"Be specific. Use *bold* for day names only. No ## headers. No fluff. "
+        f"Do NOT ask follow-up questions."
     )
     response = await ask_claude(prompt, max_tokens=900)
     await update.message.reply_text(response, parse_mode="Markdown")
@@ -325,7 +345,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorised(update): return
     text = update.message.text.strip()
 
-    # Setup flow
     if context.user_data.get("setup_step") == 1:
         try:
             weight = float(text.replace("kg", "").strip())
@@ -341,7 +360,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Just send a number, e.g. 68.5")
         return
 
-    # Reset confirmation
     if context.user_data.get("awaiting_reset_confirm"):
         context.user_data.pop("awaiting_reset_confirm", None)
         if text.lower().strip() == "yes":
@@ -351,32 +369,36 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Cancelled — log kept.")
         return
 
-    # Check-in data
     if context.user_data.get("awaiting_checkin"):
         await handle_checkin_data(update, context, text)
         return
 
-    # WFH override (only needed if changing from default)
     if context.user_data.get("awaiting_wfh"):
         wfh = "home" in text.lower() or "wfh" in text.lower()
         context.user_data["wfh_today"] = wfh
         context.user_data.pop("awaiting_wfh", None)
-        today_events = get_todays_events()
-        tomorrow_events = get_tomorrows_events()
-        free_windows = get_free_windows(today_events)
-        totals_today = get_daily_totals(date.today().isoformat())
-        meals_today = get_daily_log(date.today().isoformat())
-        fridge = get_fridge()
-        last_checkin_data = get_last_checkin()
-        prompt = build_daily_prompt(
-            today_events, tomorrow_events, free_windows,
-            totals_today, meals_today, fridge, last_checkin_data, wfh
-        )
-        response = await ask_claude(prompt)
-        await update.message.reply_text(response, parse_mode="Markdown")
+        await send_daily_plan(update, context, wfh)
         return
 
     await handle_smart_message(update, context, text)
+
+
+# ── Shared: build and send today's plan ──────────────────────────────────────
+async def send_daily_plan(update: Update, context: ContextTypes.DEFAULT_TYPE, wfh: bool):
+    today_events = get_todays_events()
+    tomorrow_events = get_tomorrows_events()
+    free_windows = get_free_windows(today_events, day_offset=0)
+    tomorrow_free_windows = get_free_windows(tomorrow_events, day_offset=1)
+    totals_today = get_daily_totals(date.today().isoformat())
+    meals_today = get_daily_log(date.today().isoformat())
+    fridge = get_fridge()
+    last_checkin_data = get_last_checkin()
+    prompt = build_daily_prompt(
+        today_events, tomorrow_events, free_windows, tomorrow_free_windows,
+        totals_today, meals_today, fridge, last_checkin_data, wfh
+    )
+    response = await ask_claude(prompt, max_tokens=800)
+    await update.message.reply_text(response, parse_mode="Markdown")
 
 
 # ── Check-in data parser ─────────────────────────────────────────────────────
@@ -412,7 +434,8 @@ async def handle_checkin_data(update, context, text):
     prompt = (
         f"Krisz just logged: {details}. Previous: {json.dumps(last)}.\n"
         f"Goal: recomposition + marathon training. Targets: 2155 kcal, 124g protein.\n"
-        f"2-3 sentence honest assessment. Flag anything worth adjusting. No cheerleading. No headers."
+        f"2-3 sentence honest assessment. Flag anything worth adjusting. No cheerleading. No headers. "
+        f"Do NOT ask follow-up questions."
     )
     assessment = await ask_claude(prompt)
     await update.message.reply_text(f"✅ Check-in logged: {details}\n\n{assessment}", parse_mode="Markdown")
@@ -454,7 +477,6 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ── Smart intent detection ───────────────────────────────────────────────────
 async def handle_smart_message(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
-    # Strip voice transcription prefix before intent detection
     clean_text = strip_heard_prefix(text)
 
     intent_prompt = (
@@ -466,6 +488,9 @@ async def handle_smart_message(update: Update, context: ContextTypes.DEFAULT_TYP
         f"- weight_checkin: sharing weight, body fat, or muscle percentage numbers\n"
         f"- fridge_update: listing food she has at home\n"
         f"- wfh_response: saying whether working from home or office today\n"
+        f"- schedule_correction: correcting or clarifying something about TODAY's schedule or "
+        f"training (e.g. 'I don't have training today', 'that run was yesterday', "
+        f"'I'm not doing the gym today', 'no training scheduled')\n"
         f"- question: anything else\n\n"
         f"Message: '{clean_text}'\n\n"
         f"Reply with ONLY the intent word."
@@ -488,9 +513,12 @@ async def handle_smart_message(update: Update, context: ContextTypes.DEFAULT_TYP
         if not meals:
             await update.message.reply_text("Nothing logged yet today.")
             return
-        lines = [f"• {m['description']} — {m['calories']} kcal · {m['protein']}g protein" for m in meals]
+        lines = [
+            f"• {m['description']} — {m['calories']} kcal · {m['protein']}g protein · {m.get('fiber', 0)}g fiber"
+            for m in meals
+        ]
         t = get_daily_totals(date.today().isoformat())
-        lines.append(f"\n*Total: {t['calories']} kcal · {t['protein']}g protein*")
+        lines.append(f"\n*Total: {t['calories']} kcal · {t['protein']}g protein · {t.get('fiber', 0)}g fiber*")
         await update.message.reply_text("*Today's logged meals:*\n\n" + "\n".join(lines), parse_mode="Markdown")
 
     elif "weight_checkin" in intent:
@@ -499,22 +527,16 @@ async def handle_smart_message(update: Update, context: ContextTypes.DEFAULT_TYP
     elif "fridge_update" in intent:
         await process_fridge_update(update, clean_text)
 
+    elif "schedule_correction" in intent:
+        set_today_override(date.today().isoformat(), clean_text)
+        wfh = get_wfh_status(context.user_data.get("wfh_today"))
+        await update.message.reply_text("Got it — noted for today. Updating your plan...")
+        await send_daily_plan(update, context, wfh)
+
     elif "wfh_response" in intent:
         wfh = any(w in clean_text.lower() for w in ["home", "wfh", "remote"])
         context.user_data["wfh_today"] = wfh
-        today_events = get_todays_events()
-        tomorrow_events = get_tomorrows_events()
-        free_windows = get_free_windows(today_events)
-        totals_today = get_daily_totals(date.today().isoformat())
-        meals_today = get_daily_log(date.today().isoformat())
-        fridge = get_fridge()
-        last_checkin_data = get_last_checkin()
-        prompt = build_daily_prompt(
-            today_events, tomorrow_events, free_windows,
-            totals_today, meals_today, fridge, last_checkin_data, wfh
-        )
-        response = await ask_claude(prompt)
-        await update.message.reply_text(response, parse_mode="Markdown")
+        await send_daily_plan(update, context, wfh)
 
     else:
         today_events = get_todays_events()
@@ -532,16 +554,17 @@ async def process_food_log(update: Update, text: str):
     prompt = (
         f"Krisz just ate: '{text}'\n"
         f"Totals so far today: {json.dumps(totals_before)}\n"
-        f"Targets: 2155 kcal, 124g protein (135g on training days).\n\n"
-        f"Estimate calories and protein. Be accurate — include ALL items mentioned.\n"
+        f"Targets: 2155 kcal, 124g protein (135g on training days), ~{FIBER_TARGET}g fiber (general guideline).\n\n"
+        f"Estimate calories, protein, and fiber. Be accurate — include ALL items mentioned.\n"
         f"Reply in this EXACT format, nothing else:\n"
         f"CALORIES: [integer]\n"
         f"PROTEIN: [integer]\n"
-        f"COMMENT: [one sentence on running totals or protein gap]"
+        f"FIBER: [integer]\n"
+        f"COMMENT: [one sentence on running totals, protein gap, or fiber if notably low/high]"
     )
     response = await ask_claude(prompt)
     lines = response.strip().split("\n")
-    cal = prot = None
+    cal = prot = fiber = None
     comment = ""
 
     for line in lines:
@@ -558,27 +581,36 @@ async def process_food_log(update: Update, text: str):
                 prot = int(float(val))
             except:
                 pass
+        elif line.upper().startswith("FIBER:"):
+            try:
+                val = line.split(":", 1)[1].strip().split()[0].replace(",", "")
+                fiber = int(float(val))
+            except:
+                pass
         elif line.upper().startswith("COMMENT:"):
             comment = line.split(":", 1)[1].strip()
 
-    # Fallback: if still None, try finding any number after the keyword
-    if cal is None or prot is None:
-        import re
-        if cal is None:
-            m = re.search(r'CALORIES[:\s]+(\d+)', response, re.IGNORECASE)
-            if m: cal = int(m.group(1))
-        if prot is None:
-            m = re.search(r'PROTEIN[:\s]+(\d+)', response, re.IGNORECASE)
-            if m: prot = int(m.group(1))
+    import re
+    if cal is None:
+        m = re.search(r'CALORIES[:\s]+(\d+)', response, re.IGNORECASE)
+        if m: cal = int(m.group(1))
+    if prot is None:
+        m = re.search(r'PROTEIN[:\s]+(\d+)', response, re.IGNORECASE)
+        if m: prot = int(m.group(1))
+    if fiber is None:
+        m = re.search(r'FIBER[:\s]+(\d+)', response, re.IGNORECASE)
+        if m: fiber = int(m.group(1))
 
     if cal and cal > 0:
         prot = prot or 0
-        log_meal(date.today().isoformat(), text, cal, prot)
+        fiber = fiber or 0
+        log_meal(date.today().isoformat(), text, cal, prot, fiber)
         new_totals = get_daily_totals(date.today().isoformat())
         await update.message.reply_text(
             f"✅ Logged: *{text}*\n"
-            f"~{cal} kcal · {prot}g protein\n\n"
-            f"📊 *Today so far:* {new_totals['calories']} kcal · {new_totals['protein']}g protein\n\n"
+            f"~{cal} kcal · {prot}g protein · {fiber}g fiber\n\n"
+            f"📊 *Today so far:* {new_totals['calories']} kcal · {new_totals['protein']}g protein · "
+            f"{new_totals.get('fiber', 0)}g fiber\n\n"
             f"_{comment}_",
             parse_mode="Markdown"
         )
@@ -591,7 +623,6 @@ async def process_food_log(update: Update, text: str):
 # ── Fridge update processor ──────────────────────────────────────────────────
 async def process_fridge_update(update: Update, text: str):
     clean = strip_heard_prefix(text)
-    # Also strip common phrases before the actual food list
     for prefix in ["this is what i have in my fridge", "i have in my fridge", "my fridge has", "in my fridge:"]:
         if clean.lower().startswith(prefix):
             clean = clean[len(prefix):].strip(":").strip()
@@ -599,9 +630,10 @@ async def process_fridge_update(update: Update, text: str):
 
     set_fridge(clean)
     prompt = (
-        f"Krisz has: {clean}\n"
-        f"Targets: ~2155 kcal/day, 124g protein. Simple meals, variety, no long prep.\n"
-        f"Suggest 3 meals for the week. One line each with rough kcal and protein. No headers."
+        f"Krisz has EXACTLY this and nothing else: {clean}\n"
+        f"Targets: ~2155 kcal/day, 124g protein, ~{FIBER_TARGET}g fiber. Simple meals, variety, no long prep.\n"
+        f"Suggest 3 meals for the week using ONLY ingredients from the list above — do not invent or assume "
+        f"any ingredient not explicitly listed. One line each with rough kcal and protein. No headers."
     )
     suggestions = await ask_claude(prompt)
     await update.message.reply_text(
@@ -611,43 +643,71 @@ async def process_fridge_update(update: Update, text: str):
 
 
 # ── Prompt builders ──────────────────────────────────────────────────────────
-def build_daily_prompt(today_events, tomorrow_events, free_windows, totals, meals, fridge, last_checkin, wfh):
+def build_daily_prompt(today_events, tomorrow_events, free_windows, tomorrow_free_windows,
+                        totals, meals, fridge, last_checkin, wfh):
     today_str = date.today().strftime("%A %d %B")
-    weekday = datetime.now(VIENNA_TZ).weekday()
     wfh_str = "working from home" if wfh else "in the office (Mariahilfer Strasse 54)"
 
     meals_str = "\n".join([
-        f"- {m['description']}: {m['calories']} kcal, {m['protein']}g protein"
+        f"- {m['description']}: {m['calories']} kcal, {m['protein']}g protein, {m.get('fiber', 0)}g fiber"
         for m in meals
     ]) if meals else "Nothing logged yet"
 
     training_today = [e for e in today_events if e.get("type") == "training"]
     training_str = ", ".join([e["summary"] for e in training_today]) if training_today else "None scheduled"
 
+    training_tomorrow = [e for e in tomorrow_events if e.get("type") == "training"]
+    training_tomorrow_str = ", ".join([e["summary"] for e in training_tomorrow]) if training_tomorrow else "None scheduled"
+
     free_str = ", ".join([f"{w['start']}–{w['end']} ({w['minutes']}min)" for w in free_windows]) if free_windows else "No clear gaps found"
+    free_tomorrow_str = ", ".join([f"{w['start']}–{w['end']} ({w['minutes']}min)" for w in tomorrow_free_windows]) if tomorrow_free_windows else "No clear gaps found"
+
+    override = get_today_override(date.today().isoformat())
+    override_str = (
+        f"\nSCHEDULE CORRECTION FROM KRISZ (this OVERRIDES any conflicting calendar training "
+        f"event for today — if she said no training today, do NOT suggest training today): {override}\n"
+        if override else ""
+    )
+
+    tomorrow_weekday = (datetime.now(VIENNA_TZ) + timedelta(days=1)).weekday()
+    tomorrow_wfh = tomorrow_weekday in WFH_DAYS
+    tomorrow_wfh_str = "WFH" if tomorrow_wfh else "office (Mariahilfer Strasse 54)"
 
     return (
         f"You are Krisz's personal trainer and nutritionist. Today is {today_str}.\n"
-        f"She is {wfh_str}.\n\n"
+        f"She is {wfh_str}.\n"
+        f"{override_str}\n"
         f"CALENDAR TODAY:\n{format_events(today_events)}\n"
         f"TRAINING TODAY: {training_str}\n"
-        f"FREE TIME WINDOWS TODAY: {free_str}\n"
-        f"CALENDAR TOMORROW:\n{format_events(tomorrow_events)}\n"
+        f"FREE TIME WINDOWS TODAY: {free_str}\n\n"
+        f"CALENDAR TOMORROW ({tomorrow_wfh_str}):\n{format_events(tomorrow_events)}\n"
+        f"TRAINING TOMORROW: {training_tomorrow_str}\n"
+        f"FREE TIME WINDOWS TOMORROW: {free_tomorrow_str}\n\n"
         f"FOOD AT HOME: {fridge or 'not updated'}\n"
         f"TODAY NUTRITION TOTALS: {json.dumps(totals)}\n"
         f"TODAY LOGGED MEALS:\n{meals_str}\n"
         f"LAST CHECK-IN: {json.dumps(last_checkin)}\n\n"
         f"KRISZ'S PROFILE:\n"
         f"- Half marathon Runna block. Ashtanga = strength training.\n"
-        f"- Runna events are all-day with no fixed time. Suggest the best time window from free windows above.\n"
-        f"- WFH Mon+Fri: runs can fit during day gaps. Office Tue/Wed/Thu: runs only before 8am or after 18:30.\n"
-        f"- Targets: 2155 kcal/day, 124g protein (135g training days), rest days ~1900 kcal.\n"
+        f"- Runna events are all-day with no fixed time. Suggest the best time window from free windows.\n"
+        f"- MORNING ROUTINE: needs {MORNING_PREP_MINUTES}min for wake-up/prep (skincare, meds, breakfast). "
+        f"On OFFICE days additionally needs {COMMUTE_MINUTES}min commute — total {OFFICE_BUFFER_MINUTES}min "
+        f"before she can leave home, AFTER any training+shower (~15min). On WFH days the buffer is "
+        f"only ~{WFH_BUFFER_MINUTES}min.\n"
+        f"- WFH Mon+Fri: runs/yoga can fit during day gaps. Office Tue/Wed/Thu: training only before "
+        f"~6:30am (to clear the {OFFICE_BUFFER_MINUTES}min buffer + training + shower before first meeting) "
+        f"or after ~18:30.\n"
+        f"- Targets: 2155 kcal/day, 124g protein (135g training days), rest days ~1900 kcal, "
+        f"~{FIBER_TARGET}g fiber (general guideline, not strict).\n"
         f"- Simple meals, gets bored of meal prep. Food noise issues — don't suggest extra eating.\n"
         f"- Tone: direct, no fluff, no cheerleading, do NOT ask follow-up questions.\n\n"
         f"Give her daily brief:\n"
-        f"1. *Training* — what and specifically when (use free windows)\n"
-        f"2. *Nutrition* — what to eat based on fridge and WFH/office status\n"
-        f"3. *Tomorrow* — pack bag or alarm if needed\n\n"
+        f"1. *Training* — what and specifically when today (use free windows + morning routine constraints)\n"
+        f"2. *Nutrition* — what to eat based on fridge (use ONLY listed ingredients) and WFH/office status. "
+        f"Match meal type to time of day (breakfast in the morning, not lunch/dinner options).\n"
+        f"3. *Tomorrow* — pack bag/alarm if training tomorrow. If NO training is scheduled tomorrow AND "
+        f"there's a free window of 75+ minutes, suggest Ashtanga yoga (60min incl. setup) at the best time "
+        f"given tomorrow's {tomorrow_wfh_str} status and free windows.\n\n"
         f"Use *bold* for section labels only. No ## headers."
     )
 
@@ -655,18 +715,30 @@ def build_daily_prompt(today_events, tomorrow_events, free_windows, totals, meal
 def build_coach_prompt(question, today_events, totals, meals, last_checkin):
     today_str = date.today().strftime("%A %d %B")
     meals_str = "\n".join([
-        f"- {m['description']}: {m['calories']} kcal, {m['protein']}g protein"
+        f"- {m['description']}: {m['calories']} kcal, {m['protein']}g protein, {m.get('fiber', 0)}g fiber"
         for m in meals
     ]) if meals else "Nothing logged yet"
 
+    override = get_today_override(date.today().isoformat())
+    override_str = f"\nSCHEDULE CORRECTION FROM KRISZ TODAY (overrides calendar): {override}\n" if override else ""
+
+    now_hour = datetime.now(VIENNA_TZ).hour
+    time_of_day = "morning" if now_hour < 11 else "midday" if now_hour < 15 else "afternoon" if now_hour < 18 else "evening"
+
     return (
-        f"You are Krisz's personal trainer. Today is {today_str}.\n"
+        f"You are Krisz's personal trainer. Today is {today_str}, it's currently {time_of_day} "
+        f"({datetime.now(VIENNA_TZ).strftime('%H:%M')}).\n"
+        f"{override_str}"
         f"CALENDAR: {format_events(today_events)}\n"
         f"NUTRITION TOTALS: {json.dumps(totals)}\n"
         f"LOGGED MEALS:\n{meals_str}\n"
         f"LAST CHECK-IN: {json.dumps(last_checkin)}\n\n"
-        f"PROFILE: Half marathon + Ashtanga (strength). Targets: 2155 kcal, 124g protein. "
-        f"WFH Mon+Fri, office Tue/Wed/Thu. Direct tone, no fluff, do NOT ask follow-up questions.\n\n"
+        f"PROFILE: Half marathon + Ashtanga (strength). Targets: 2155 kcal, 124g protein, "
+        f"~{FIBER_TARGET}g fiber. WFH Mon+Fri, office Tue/Wed/Thu. "
+        f"Morning routine needs {MORNING_PREP_MINUTES}min prep (+{COMMUTE_MINUTES}min commute on office days). "
+        f"Direct tone, no fluff, do NOT ask follow-up questions. "
+        f"If asked about food/meals, match suggestions to the CURRENT time of day ({time_of_day}) — "
+        f"don't give lunch/dinner options if it's morning, etc.\n\n"
         f"Question: {question}\n\nAnswer directly and concisely. No ## headers."
     )
 
