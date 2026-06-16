@@ -72,6 +72,11 @@ def _fetch_events(start_dt: datetime, end_dt: datetime) -> list:
     start_iso = start_dt.isoformat()
     end_iso = end_dt.isoformat()
 
+    # The Vienna-local date this query represents — used to filter all-day events,
+    # since Google's all-day event date ranges are UTC-midnight-based and can leak
+    # into adjacent days when Vienna is UTC+1/+2.
+    target_date = start_dt.date()
+
     try:
         calendar_list = service.calendarList().list().execute()
         calendars = calendar_list.get("items", [])
@@ -95,6 +100,18 @@ def _fetch_events(start_dt: datetime, end_dt: datetime) -> list:
                     end = event.get("end", {})
                     summary = event.get("summary", "Busy")
                     is_all_day = "date" in start and "dateTime" not in start
+
+                    if is_all_day:
+                        # All-day events have exclusive end dates (e.g. start=06-08, end=06-09
+                        # means the event covers only June 8). Only keep this event if
+                        # target_date actually falls within [start_date, end_date).
+                        try:
+                            event_start_date = datetime.strptime(start["date"], "%Y-%m-%d").date()
+                            event_end_date = datetime.strptime(end["date"], "%Y-%m-%d").date()
+                            if not (event_start_date <= target_date < event_end_date):
+                                continue
+                        except Exception:
+                            pass
 
                     all_events.append({
                         "summary": summary,
