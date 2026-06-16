@@ -49,7 +49,26 @@ MORNING_PREP_MINUTES = 40  # skincare, meds, breakfast
 OFFICE_BUFFER_MINUTES = COMMUTE_MINUTES + MORNING_PREP_MINUTES  # 85
 WFH_BUFFER_MINUTES = 15
 
+EARLIEST_WAKE = "07:15"  # absolute earliest Krisz will wake up, and only for yoga
+YOGA_MINUTES = 60
+
 FIBER_TARGET = 30  # general daily guideline, not a strict target like protein
+
+# Shared timing rules injected into every prompt that touches training scheduling
+TIMING_RULES = (
+    f"TIMING RULES (important, non-negotiable):\n"
+    f"- Krisz does NOT want early-morning runs, ever. Runs fit into WFH daytime gaps or "
+    f"evenings (after ~17:30) — never as a pre-work first-thing-in-the-morning session.\n"
+    f"- The ONLY activity she's willing to wake up early for is Ashtanga yoga, and her "
+    f"absolute earliest acceptable wake time is {EARLIEST_WAKE}. Never suggest waking earlier "
+    f"than this, for anything.\n"
+    f"- Morning yoga ({YOGA_MINUTES}min starting at {EARLIEST_WAKE}, finishing 08:15) "
+    f"is only viable on office days if it still leaves {OFFICE_BUFFER_MINUTES}min before her first "
+    f"commitment (i.e. first meeting at ~09:40 or later). On WFH days it just needs "
+    f"{WFH_BUFFER_MINUTES}min after.\n"
+    f"- If morning yoga doesn't fit on a given day, suggest evening yoga, a different day, or skip "
+    f"it — do not suggest waking earlier than {EARLIEST_WAKE} under any circumstance."
+)
 
 
 def is_authorised(update: Update) -> bool:
@@ -306,12 +325,12 @@ async def week(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"KRISZ'S PROFILE:\n"
         f"- Half marathon Runna training block. Ashtanga = strength training.\n"
         f"- Runna events in calendar are all-day events with no fixed time — suggest the best time slot.\n"
-        f"- WFH days (Mon/Fri): runs fit in calendar gaps during the day.\n"
-        f"- Office days (Tue/Wed/Thu): runs only before ~6:30am (need {OFFICE_BUFFER_MINUTES}min "
-        f"before first meeting for run+shower+commute+prep) or after ~18:30.\n"
+        f"- WFH days (Mon/Fri): training/yoga fit in calendar gaps. Office days (Tue/Wed/Thu): "
+        f"runs go in the evening (after ~17:30).\n"
         f"- Busy blocks are work meetings — immovable.\n"
-        f"- On days with no run scheduled, suggest Ashtanga yoga (60min incl. setup) if there's a "
-        f"free window of 75+ minutes.\n\n"
+        f"{TIMING_RULES}\n"
+        f"- On days with no run scheduled, suggest Ashtanga yoga (60min incl. setup) if it fits "
+        f"per the timing rules above.\n\n"
         f"Provide:\n"
         f"1. For each day with a Runna event: the run details and best suggested time window\n"
         f"2. Best days for Ashtanga if not already covered above\n"
@@ -480,7 +499,7 @@ async def handle_smart_message(update: Update, context: ContextTypes.DEFAULT_TYP
     clean_text = strip_heard_prefix(text)
 
     intent_prompt = (
-        f"Classify this message into exactly one intent:\n\n"
+        f"Classify this message into intent(s):\n\n"
         f"- food_log: reporting what she has eaten or is eating right now\n"
         f"- food_question: asking about calories, nutrition, or what to eat — NOT reporting eating\n"
         f"- delete_log: wants to delete, clear, reset logged food\n"
@@ -493,62 +512,77 @@ async def handle_smart_message(update: Update, context: ContextTypes.DEFAULT_TYP
         f"'that run was yesterday', 'no training scheduled')\n"
         f"- missed_training: she SKIPPED or DIDN'T DO a training session that WAS correctly "
         f"scheduled (e.g. 'I missed my run today', 'didn't get to my run', 'skipped training', "
-        f"'couldn't do the run')\n"
+        f"'couldn't do the run', 'when should I reschedule my missed run')\n"
         f"- question: anything else\n\n"
         f"Message: '{clean_text}'\n\n"
-        f"Reply with ONLY the intent word."
+        f"If the message contains MULTIPLE distinct things — e.g. she's reporting food AND "
+        f"separately asking about a missed run, or asking two unrelated things — reply with ALL "
+        f"relevant intents separated by commas (e.g. 'food_log,missed_training'). "
+        f"Otherwise reply with just one intent word. No other text."
     )
-    intent = (await ask_claude(intent_prompt, max_tokens=20)).strip().lower()
-    logger.info(f"Intent: {intent} | Message: {clean_text[:60]}")
+    intent_response = (await ask_claude(intent_prompt, max_tokens=30)).strip().lower()
+    intents = [i.strip() for i in intent_response.split(",") if i.strip()]
+    logger.info(f"Intents: {intents} | Message: {clean_text[:60]}")
 
-    if "food_log" in intent:
+    handled = False
+
+    if "food_log" in intents:
         await process_food_log(update, clean_text)
+        handled = True
 
-    elif "delete_log" in intent:
-        context.user_data["awaiting_reset_confirm"] = True
-        await update.message.reply_text(
-            "Delete all food logged today?\n\nReply *yes* to confirm.",
-            parse_mode="Markdown"
-        )
-
-    elif "show_log" in intent:
-        meals = get_daily_log(date.today().isoformat())
-        if not meals:
-            await update.message.reply_text("Nothing logged yet today.")
-            return
-        lines = [
-            f"• {m['description']} — {m['calories']} kcal · {m['protein']}g protein · {m.get('fiber', 0)}g fiber"
-            for m in meals
-        ]
-        t = get_daily_totals(date.today().isoformat())
-        lines.append(f"\n*Total: {t['calories']} kcal · {t['protein']}g protein · {t.get('fiber', 0)}g fiber*")
-        await update.message.reply_text("*Today's logged meals:*\n\n" + "\n".join(lines), parse_mode="Markdown")
-
-    elif "weight_checkin" in intent:
-        await handle_checkin_data(update, context, clean_text)
-
-    elif "fridge_update" in intent:
+    if "fridge_update" in intents:
         await process_fridge_update(update, clean_text)
+        handled = True
 
-    elif "missed_training" in intent:
+    if "weight_checkin" in intents:
+        await handle_checkin_data(update, context, clean_text)
+        handled = True
+
+    if "missed_training" in intents:
         set_today_override(
             date.today().isoformat(),
             f"Missed/skipped a scheduled training session today: {clean_text}"
         )
         await handle_missed_training(update, clean_text)
+        handled = True
 
-    elif "schedule_correction" in intent:
+    if "delete_log" in intents:
+        context.user_data["awaiting_reset_confirm"] = True
+        await update.message.reply_text(
+            "Delete all food logged today?\n\nReply *yes* to confirm.",
+            parse_mode="Markdown"
+        )
+        handled = True
+
+    if "show_log" in intents:
+        meals = get_daily_log(date.today().isoformat())
+        if not meals:
+            await update.message.reply_text("Nothing logged yet today.")
+        else:
+            lines = [
+                f"• {m['description']} — {m['calories']} kcal · {m['protein']}g protein · {m.get('fiber', 0)}g fiber"
+                for m in meals
+            ]
+            t = get_daily_totals(date.today().isoformat())
+            lines.append(f"\n*Total: {t['calories']} kcal · {t['protein']}g protein · {t.get('fiber', 0)}g fiber*")
+            await update.message.reply_text("*Today's logged meals:*\n\n" + "\n".join(lines), parse_mode="Markdown")
+        handled = True
+
+    # schedule_correction and wfh_response both produce a full daily plan —
+    # only run one of them to avoid sending the plan twice
+    if "schedule_correction" in intents and "missed_training" not in intents:
         set_today_override(date.today().isoformat(), clean_text)
         wfh = get_wfh_status(context.user_data.get("wfh_today"))
         await update.message.reply_text("Got it — noted for today. Updating your plan...")
         await send_daily_plan(update, context, wfh)
-
-    elif "wfh_response" in intent:
+        handled = True
+    elif "wfh_response" in intents:
         wfh = any(w in clean_text.lower() for w in ["home", "wfh", "remote"])
         context.user_data["wfh_today"] = wfh
         await send_daily_plan(update, context, wfh)
+        handled = True
 
-    else:
+    if not handled:
         today_events = get_todays_events()
         totals_today = get_daily_totals(date.today().isoformat())
         meals_today = get_daily_log(date.today().isoformat())
@@ -570,7 +604,9 @@ async def process_food_log(update: Update, text: str):
         f"CALORIES: [integer]\n"
         f"PROTEIN: [integer]\n"
         f"FIBER: [integer]\n"
-        f"COMMENT: [one sentence on running totals, protein gap, or fiber if notably low/high]"
+        f"COMMENT: [ONE sentence about NUTRITION ONLY — running totals, protein/fiber gap. "
+        f"If the message also mentions training, schedule, missed runs, or anything non-food, "
+        f"IGNORE that completely here — it's handled in a separate message.]"
     )
     response = await ask_claude(prompt)
     lines = response.strip().split("\n")
@@ -674,13 +710,25 @@ async def handle_missed_training(update: Update, text: str):
         f"This means she skipped/missed a training session that was scheduled for today.\n\n"
         f"Rest of week calendar:\n" + "\n".join(summary_lines) + "\n\n"
         f"PROFILE: Half marathon training block, Ashtanga = strength training. "
-        f"On office days (Tue/Wed/Thu), training only fits before ~6:30am "
-        f"(needs {OFFICE_BUFFER_MINUTES}min buffer for prep+commute after training+shower) "
-        f"or after ~18:30. On WFH days (Mon/Fri) it fits in day gaps.\n\n"
-        f"Suggest the best 1-2 days/times this week to fit in the missed session. "
-        f"Avoid stacking it right before or after an already-hard session if possible. "
-        f"Be specific about day and time window. 2-3 sentences max. No fluff, no headers, "
-        f"do NOT ask follow-up questions."
+        f"{TIMING_RULES}\n\n"
+        f"DECISION CRITERIA for skip vs reschedule:\n"
+        f"- First, classify the missed session by its name (visible in today's training above): "
+        f"'Easy run' = LOW priority, fine to drop entirely without makeup. 'Long run' or "
+        f"'Progressive run' = HIGHER priority, worth fitting in once IF a genuinely free day "
+        f"exists without compressing recovery. Speed/interval sessions (e.g. 'Rolling 400s', "
+        f"'Tempo', 'Intervals', 'Fartlek') = MODERATE priority, usually fine to drop — one missed "
+        f"speed session rarely affects a half marathon block. Ashtanga/yoga = flexible, move freely.\n"
+        f"- NEVER place the makeup session on a day immediately before or after another hard "
+        f"session already on the calendar this week — no back-to-back hard days.\n"
+        f"- If no day satisfies the above without compressing recovery, choose to SKIP — say so "
+        f"plainly with the reason.\n"
+        f"- Default toward skipping LOW and MODERATE priority sessions rather than cramming. "
+        f"Only fight to reschedule a LONG run, and only if it genuinely fits.\n\n"
+        f"Give exactly ONE decisive recommendation — either:\n"
+        f"(a) ONE specific day AND specific time window to do the makeup session, or\n"
+        f"(b) a clear decision to skip it this week, with a one-line reason based on the criteria above.\n"
+        f"Do NOT present multiple options or alternatives. Pick one and commit. "
+        f"2-3 sentences max. No headers, no follow-up questions."
     )
     response = await ask_claude(prompt, max_tokens=300)
     await update.message.reply_text(f"No worries — noted.\n\n{response}", parse_mode="Markdown")
@@ -738,9 +786,9 @@ def build_daily_prompt(today_events, tomorrow_events, free_windows, tomorrow_fre
         f"On OFFICE days additionally needs {COMMUTE_MINUTES}min commute — total {OFFICE_BUFFER_MINUTES}min "
         f"before she can leave home, AFTER any training+shower (~15min). On WFH days the buffer is "
         f"only ~{WFH_BUFFER_MINUTES}min.\n"
-        f"- WFH Mon+Fri: runs/yoga can fit during day gaps. Office Tue/Wed/Thu: training only before "
-        f"~6:30am (to clear the {OFFICE_BUFFER_MINUTES}min buffer + training + shower before first meeting) "
-        f"or after ~18:30.\n"
+        f"- WFH Mon+Fri: training/yoga can fit during day gaps. Office Tue/Wed/Thu: runs go in "
+        f"the evening (after ~17:30).\n"
+        f"{TIMING_RULES}\n"
         f"- Targets: 2155 kcal/day, 124g protein (135g training days), rest days ~1900 kcal, "
         f"~{FIBER_TARGET}g fiber (general guideline, not strict).\n"
         f"- Simple meals, gets bored of meal prep. Food noise issues — don't suggest extra eating.\n"
@@ -780,6 +828,7 @@ def build_coach_prompt(question, today_events, totals, meals, last_checkin):
         f"PROFILE: Half marathon + Ashtanga (strength). Targets: 2155 kcal, 124g protein, "
         f"~{FIBER_TARGET}g fiber. WFH Mon+Fri, office Tue/Wed/Thu. "
         f"Morning routine needs {MORNING_PREP_MINUTES}min prep (+{COMMUTE_MINUTES}min commute on office days). "
+        f"{TIMING_RULES}\n"
         f"Direct tone, no fluff, do NOT ask follow-up questions. "
         f"If asked about food/meals, match suggestions to the CURRENT time of day ({time_of_day}) — "
         f"don't give lunch/dinner options if it's morning, etc.\n\n"
